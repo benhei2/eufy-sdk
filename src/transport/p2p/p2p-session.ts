@@ -254,7 +254,7 @@ const CMD_DATABASE = 1306;
  * Inner query cmds carried in a {@link CMD_DATABASE} payload. `FULL_TABLE` reads one table whole;
  * `COMBINATION_WITH_AI` is the AI event-history read that bundles the face roster.
  */
-const DB_QUERY = { FULL_TABLE: 10000, COMBINATION_WITH_AI: 10011 } as const;
+const DB_QUERY = { FULL_TABLE: 10000, COMBINATION_WITH_AI: 10011, QUERY_LOCAL: 10017 } as const;
 /** AAD for the level-2 (gateway/"signCode 8") AES-256-GCM frames — fixed across all eufy P2P. */
 const GCM_AAD = Buffer.from("eufy security");
 
@@ -361,7 +361,7 @@ const DB_TABLE_TIMEOUT_MS = 15_000;
  * Re-decoded UTF-8 first. `dbChunk` carries latin1, which preserves the bytes and mangles every name
  * outside ASCII until the document is read back in the encoding it was written in.
  */
-function firstTableRows(text: string): unknown[] | undefined {
+function firstTableRows(text: string): { rows?: unknown[]; error?: number } | undefined {
   const decoded = Buffer.from(text, "latin1").toString("utf8");
   for (let start = decoded.indexOf("{"); start >= 0; start = decoded.indexOf("{", start + 1)) {
     const end = closingBrace(decoded, start);
@@ -372,8 +372,10 @@ function firstTableRows(text: string): unknown[] | undefined {
     } catch {
       continue;
     }
-    const data = (parsed as { data?: unknown } | null)?.data;
-    if (Array.isArray(data)) return data;
+    const reply = parsed as { data?: unknown; mIntRet?: unknown } | null;
+    if (typeof reply?.mIntRet === "number" && reply.mIntRet !== 0) return { error: reply.mIntRet };
+    if (reply?.data === "[]") return { rows: [] };
+    if (Array.isArray(reply?.data)) return { rows: reply.data };
   }
   return undefined;
 }
@@ -1781,6 +1783,40 @@ export class P2PSession extends EventEmitter {
   }
 
   /**
+   * Read a date-ranged page of `history_record_info` from the station. The reply's `data` array groups
+   * recording rows with companion tables; each group retains its `table_name` and `payload`.
+   * `startTime` is `"0"` for the newest page or the oldest row's `yyyyMMddHHmmss` cursor for older rows.
+   */
+  queryRecordPage(opts: {
+    accountId?: string;
+    startDate: string;
+    endDate: string;
+    startTime?: string;
+    count?: number;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }): Promise<unknown[]> {
+    return this.readDatabase("history_record_info", {
+      accountId: opts.accountId,
+      innerCmd: DB_QUERY.QUERY_LOCAL,
+      query: {
+        count: opts.count ?? 20,
+        start_date: opts.startDate,
+        end_date: opts.endDate,
+        start_time: opts.startTime ?? "0",
+        event_type: 0,
+        ai_type: 0,
+        storage_cloud: -1,
+        trigger_type: 0,
+        detection_type: 0,
+        flag: 0,
+      },
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+    });
+  }
+
+  /**
    * Query one on-station table and answer its rows, once the reply is whole.
    *
    * The request half of {@link queryDatabase} with its reply assembled: `CMD_DATABASE` arrives as
@@ -1794,18 +1830,30 @@ export class P2PSession extends EventEmitter {
    */
   async readDatabase(
     table: string,
-    opts: { accountId?: string; timeoutMs?: number; signal?: AbortSignal } = {},
+    opts: {
+      accountId?: string;
+      innerCmd?: number;
+      query?: Record<string, unknown>;
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<unknown[]> {
     if (opts.signal?.aborted) throw new Error("readDatabase: aborted");
-    this.queryDatabase(table, { accountId: opts.accountId, query: this.fullTableQuery() });
+    this.queryDatabase(table, {
+      accountId: opts.accountId,
+      innerCmd: opts.innerCmd,
+      query: opts.query ?? this.fullTableQuery(),
+    });
     this.dbReadInFlight = true;
     try {
       return await new Promise<unknown[]>((resolve, reject) => {
         let text = "";
         const onChunk = (chunk: { text: string }): void => {
           text += chunk.text;
-          const rows = firstTableRows(text);
-          if (rows) settle(() => resolve(rows));
+          const result = firstTableRows(text);
+          if (result?.error !== undefined)
+            settle(() => reject(new Error(`readDatabase: ${table} refused: ${result.error}`)));
+          else if (result?.rows) settle(() => resolve(result.rows!));
         };
         const timer = setTimeout(
           () => settle(() => reject(new Error(`readDatabase: ${this.cfg.stationSn} sent no complete ${table}`))),
