@@ -215,11 +215,13 @@ export const STATION_CHUNK_BYTES = 64000;
  * either alone would let two decodable units merge, and a merge is invisible to a consumer that trusts
  * the contract.
  *
- * **A unit is delivered only when it is complete.** A lost datagram makes the P2P layer discard the frame
- * it was reassembling, so a unit whose tail never arrives is ended by the next unit's first frame while
- * still full — that one is dropped and reported, never handed on short. Truncated bytes are worse than
- * none: a decoder given an access unit shorter than its own slice headers promise reports bitstream
- * truncation and produces no picture at all.
+ * **A unit is delivered only when it is complete AND begins with an Annex-B start code.** A lost datagram
+ * makes the P2P layer discard the frame it was reassembling, so a unit whose tail never arrives is ended
+ * by the next unit's first frame while still full — that one is dropped and reported, never handed on
+ * short. An orphan continuation (a unit whose opening frame was never received) cannot open an access unit
+ * and is therefore dropped and reported rather than being emitted as a headless unit. Truncated bytes are
+ * worse than none: a decoder given an access unit shorter than its own slice headers promise reports
+ * bitstream truncation and produces no picture at all.
  *
  * Two consequences worth stating. A unit that is exactly the threshold long, or an exact multiple of it,
  * ends on a full frame and is dropped as truncated — one frame in ~64000, reported, and the alternative is
@@ -259,6 +261,10 @@ export class AccessUnitAssembler {
       open.chunks.push(body);
       open.carried += body.length;
       if (full) return [];
+      if (!beginsAccessUnit(open.chunks[0]!)) {
+        this.discard();
+        return [];
+      }
       this.open = undefined;
       return [unitOf(open.header, Buffer.concat(open.chunks))];
     }
@@ -267,7 +273,13 @@ export class AccessUnitAssembler {
       this.open = { header, chunks: [body], carried: body.length };
       return [];
     }
-    return [unitOf(header, body)];
+    const begins = beginsAccessUnit(body);
+    if (begins) {
+      return [unitOf(header, body)];
+    }
+    this.droppedUnits++;
+    this.onDropped?.({ carried: body.length, chunks: 1, count: this.droppedUnits });
+    return [];
   }
 
   /** Forget an incomplete unit, counting and reporting it. */

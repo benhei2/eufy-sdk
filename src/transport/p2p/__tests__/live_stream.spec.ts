@@ -278,15 +278,14 @@ describe("LiveStream access-unit reassembly", () => {
     expect(frames[0].data.equals(small)).toBe(true);
   });
 
-  /** Nor one whose header describes a different unit, even where it continues mid-NAL. */
-  it("does not absorb a continuation-shaped frame belonging to another unit", () => {
+  /** A continuation belonging to another unit cannot open an access unit without a start code. */
+  it("drops a continuation-shaped frame belonging to another unit", () => {
     const { session, frames } = mk();
 
     session.push(videoChunk(filled, { timestamp: 0x1000 }));
     session.push(videoChunk(tail, { timestamp: 0x2000 }));
 
-    expect(frames).toHaveLength(1);
-    expect(frames[0].data.equals(tail)).toBe(true);
+    expect(frames).toHaveLength(0);
   });
 
   /**
@@ -330,6 +329,17 @@ describe("LiveStream access-unit reassembly", () => {
     expect(
       logger.debug.mock.calls.filter(([message]) => String(message).includes("dropped an incomplete")).length,
     ).toBe(2);
+  });
+
+  it("drops a full orphan and its tail, then delivers the next valid unit", () => {
+    const { session, frames } = mk();
+    session.push(videoChunk(Buffer.alloc(CHUNK, 0x22), { timestamp: 0x1000, keyframe: false }));
+    session.push(videoChunk(tail, { timestamp: 0x1000, keyframe: false }));
+    expect(frames).toHaveLength(0);
+
+    session.push(videoChunk(small, { timestamp: 0x2000, keyframe: false }));
+    expect(frames).toHaveLength(1);
+    expect(frames[0].data).toEqual(small);
   });
 });
 
